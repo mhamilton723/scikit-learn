@@ -148,6 +148,7 @@ from libc.math cimport fabs, sqrt, exp, cos, pow, log, lgamma
 from libc.math cimport fmin, fmax
 from libc.stdlib cimport calloc, malloc, free
 from libc.string cimport memcpy
+from cython.parallel import prange
 
 import numpy as np
 import warnings
@@ -220,6 +221,15 @@ cdef ITYPE_t[::1] get_memview_ITYPE_1D(
 cdef ITYPE_t[:, ::1] get_memview_ITYPE_2D(
                                np.ndarray[ITYPE_t, ndim=2, mode='c'] X):
     return <ITYPE_t[:X.shape[0], :X.shape[1]:1]> (<ITYPE_t*> X.data)
+
+cdef np.int8_t[::1] get_memview_INT8_1D(
+                               np.ndarray[np.int8_t, ndim=1, mode='c'] X):
+    return <np.int8_t[:X.shape[0]:1]> (<np.int8_t*> X.data)
+
+
+cdef np.int8_t[:, ::1] get_memview_INT8_2D(
+                               np.ndarray[np.int8_t, ndim=2, mode='c'] X):
+    return <np.int8_t[:X.shape[0], :X.shape[1]:1]> (<np.int8_t*> X.data)
 
 
 cdef NodeHeapData_t[::1] get_memview_NodeHeapData_1D(
@@ -995,11 +1005,15 @@ cdef class BinaryTree:
     cdef np.ndarray idx_array_arr
     cdef np.ndarray node_data_arr
     cdef np.ndarray node_bounds_arr
+    cdef np.ndarray idx_to_node_arr
+    cdef np.ndarray selected_nodes_arr
 
     cdef readonly DTYPE_t[:, ::1] data
     cdef readonly DTYPE_t[::1] sample_weight
     cdef public DTYPE_t sum_weight
     cdef public ITYPE_t[::1] idx_array
+    cdef public np.int8_t[:, ::1] idx_to_node
+    cdef public np.int8_t[::1] selected_nodes
     cdef public NodeData_t[::1] node_data
     cdef public DTYPE_t[:, :, ::1] node_bounds
 
@@ -1026,12 +1040,16 @@ cdef class BinaryTree:
         self.idx_array_arr = np.empty(1, dtype=ITYPE, order='C')
         self.node_data_arr = np.empty(1, dtype=NodeData, order='C')
         self.node_bounds_arr = np.empty((1, 1, 1), dtype=DTYPE)
+        self.idx_to_node_arr = np.empty((1, 1), dtype=np.int8, order='C')
+        self.selected_nodes_arr = np.empty(1, dtype=np.int8, order='C')
 
         self.data = get_memview_DTYPE_2D(self.data_arr)
         self.sample_weight = get_memview_DTYPE_1D(self.sample_weight_arr)
         self.idx_array = get_memview_ITYPE_1D(self.idx_array_arr)
         self.node_data = get_memview_NodeData_1D(self.node_data_arr)
         self.node_bounds = get_memview_DTYPE_3D(self.node_bounds_arr)
+        self.idx_to_node = get_memview_INT8_2D(self.idx_to_node_arr)
+        self.selected_nodes = get_memview_INT8_1D(self.selected_nodes_arr)
 
         self.leaf_size = 0
         self.n_levels = 0
@@ -1078,6 +1096,8 @@ cdef class BinaryTree:
         # allocate arrays for storage
         self.idx_array_arr = np.arange(n_samples, dtype=ITYPE)
         self.node_data_arr = np.zeros(self.n_nodes, dtype=NodeData)
+        self.idx_to_node_arr = np.zeros((n_samples, self.n_nodes), dtype=np.int8, order='C')
+        self.selected_nodes_arr = np.ones(self.n_nodes, dtype=np.int8, order='C')
 
         self._update_sample_weight(n_samples, sample_weight)
         self._update_memviews()
@@ -1085,6 +1105,11 @@ cdef class BinaryTree:
         # Allocate tree-specific data
         allocate_data(self, self.n_nodes, n_features)
         self._recursive_build(0, 0, n_samples)
+
+        for i, node in enumerate(self.node_data):
+            for j in range(node['idx_start'], node['idx_end']):
+                self.idx_to_node_arr[self.idx_array[j], i] = True
+
 
     def _update_sample_weight(self, n_samples, sample_weight):
         if sample_weight is not None:
@@ -1103,6 +1128,8 @@ cdef class BinaryTree:
         self.idx_array = get_memview_ITYPE_1D(self.idx_array_arr)
         self.node_data = get_memview_NodeData_1D(self.node_data_arr)
         self.node_bounds = get_memview_DTYPE_3D(self.node_bounds_arr)
+        self.idx_to_node = get_memview_INT8_2D(self.idx_to_node_arr)
+        self.selected_nodes = get_memview_INT8_1D(self.selected_nodes_arr)
 
 
     def __reduce__(self):
@@ -1134,7 +1161,8 @@ cdef class BinaryTree:
                 int(self.n_splits),
                 int(self.n_calls),
                 self.dist_metric,
-                sample_weight_arr)
+                sample_weight_arr,
+                self.idx_to_node_arr)
 
     def __setstate__(self, state):
         """
@@ -1153,6 +1181,7 @@ cdef class BinaryTree:
         self.n_calls = state[10]
         self.dist_metric = state[11]
         sample_weight_arr = state[12]
+        self.idx_to_node_arr = state[13]
 
         self.euclidean = (self.dist_metric.__class__.__name__
                           == 'EuclideanDistance')
@@ -1283,6 +1312,114 @@ cdef class BinaryTree:
                                   idx_start, idx_start + n_mid)
             self._recursive_build(2 * i_node + 2,
                                   idx_start + n_mid, idx_end)
+
+    cdef void _select_nodes(self, np.int8_t[:] mask) nogil:
+        for j in range(self.n_nodes):
+            for i in range(self.data_arr.shape[0]):
+                if mask[i] and self.idx_to_node[i][j]:
+                    self.selected_nodes[j] = True
+                    break
+                elif i == (self.data_arr.shape[0] - 1):
+                    self.selected_nodes[j] = False
+
+
+    def update_node_filter(self, mask):
+        cdef np.int8_t[:] mask_view = np.frombuffer(mask, dtype=np.int8)
+        self._select_nodes(mask_view)
+
+    def conditional_query(self, X, mask, k=1,
+                          return_distance=True,
+                          sort_results=True,
+                          compute_node_filter=True):
+        """
+        query(X, k=1, return_distance=True,
+              dualtree=False, breadth_first=False)
+
+        query the tree for the k nearest neighbors
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+            An array of points to query
+        k : int, default=1
+            The number of nearest neighbors to return
+        return_distance : bool, default=True
+            if True, return a tuple (d, i) of distances and indices
+            if False, return array i
+        sort_results : bool, default=True
+            if True, then distances and indices of each point are sorted
+            on return, so that the first column contains the closest points.
+            Otherwise, neighbors are returned in an arbitrary order.
+
+        Returns
+        -------
+        i    : if return_distance == False
+        (d,i) : if return_distance == True
+
+        d : ndarray of shape X.shape[:-1] + k, dtype=double
+            Each entry gives the list of distances to the neighbors of the
+            corresponding point.
+
+        i : ndarray of shape X.shape[:-1] + k, dtype=int
+            Each entry gives the list of indices of neighbors of the
+            corresponding point.
+        """
+        # XXX: we should allow X to be a pre-built tree.
+        X = check_array(X, dtype=DTYPE, order='C')
+
+        mask = check_array(mask, dtype=bool, order='C', ensure_2d=False)
+        cdef np.int8_t[:] mask_view = np.frombuffer(mask, dtype=np.int8)
+
+        if mask.shape[0] != self.data.shape[0] or len(mask.shape) > 1:
+            raise ValueError("mask must have shape data.shape[0] where data is the"
+                             " shape of the training data")
+
+        if compute_node_filter:
+            self._select_nodes(mask_view)
+
+        if X.shape[X.ndim - 1] != self.data.shape[1]:
+            raise ValueError("query data dimension must "
+                             "match training data dimension")
+
+        if self.data.shape[0] < k:
+            raise ValueError("k must be less than or equal "
+                             "to the number of training points")
+
+        # flatten X, and save original shape information
+        np_Xarr = X.reshape((-1, self.data.shape[1]))
+        cdef DTYPE_t[:, ::1] Xarr = get_memview_DTYPE_2D(np_Xarr)
+        cdef DTYPE_t reduced_dist_LB
+        cdef ITYPE_t i
+        cdef DTYPE_t* pt
+
+        # initialize heap for neighbors
+        cdef NeighborsHeap heap = NeighborsHeap(Xarr.shape[0], k)
+
+        # bounds is needed for the dual tree algorithm
+        cdef DTYPE_t[::1] bounds
+
+        self.n_trims = 0
+        self.n_leaves = 0
+        self.n_splits = 0
+
+        pt = &Xarr[0, 0]
+
+        with nogil:
+            for i in range(Xarr.shape[0]):
+                reduced_dist_LB = min_rdist(self, 0, pt)
+                self._query_single_depthfirst_conditional(0, pt, i, heap,
+                                              reduced_dist_LB, mask_view)
+                pt += Xarr.shape[1]
+
+        distances, indices = heap.get_arrays(sort=sort_results)
+        distances = self.dist_metric.rdist_to_dist(distances)
+
+        # deflatten results
+        if return_distance:
+            return (distances.reshape(X.shape[:X.ndim - 1] + (k,)),
+                    indices.reshape(X.shape[:X.ndim - 1] + (k,)))
+        else:
+            return indices.reshape(X.shape[:X.ndim - 1] + (k,))
 
     def query(self, X, k=1, return_distance=True,
               dualtree=False, breadth_first=False,
@@ -1795,6 +1932,61 @@ cdef class BinaryTree:
                 pt += n_features
 
         return count
+
+    cdef int _query_single_depthfirst_conditional(self,
+                                                  ITYPE_t i_node,
+                                                  DTYPE_t* pt, ITYPE_t i_pt,
+                                                  NeighborsHeap heap,
+                                                  DTYPE_t reduced_dist_LB,
+                                                  np.int8_t[:] mask) nogil except -1:
+        """Recursive Single-tree k-neighbors query, depth-first approach"""
+        cdef NodeData_t node_info = self.node_data[i_node]
+
+        cdef DTYPE_t dist_pt, reduced_dist_LB_1, reduced_dist_LB_2
+        cdef ITYPE_t i, i1, i2
+        cdef DTYPE_t* data = &self.data[0, 0]
+
+        #------------------------------------------------------------
+        # Case 1: query point is outside node radius:
+        #         trim it from the query
+        if (not self.selected_nodes[i_node]) or (reduced_dist_LB > heap.largest(i_pt)):
+            self.n_trims += 1
+
+        #------------------------------------------------------------
+        # Case 2: this is a leaf node.  Update set of nearby points
+        elif node_info.is_leaf:
+            self.n_leaves += 1
+            for i in range(node_info.idx_start, node_info.idx_end):
+                if  mask[self.idx_array[i]]:
+                    dist_pt = self.rdist(pt,
+                                         &self.data[self.idx_array[i], 0],
+                                         self.data.shape[1])
+
+                    if dist_pt < heap.largest(i_pt):
+                        heap._push(i_pt, dist_pt, self.idx_array[i])
+
+        #------------------------------------------------------------
+        # Case 3: Node is not a leaf.  Recursively query subnodes
+        #         starting with the closest
+        else:
+            self.n_splits += 1
+            i1 = 2 * i_node + 1
+            i2 = i1 + 1
+            reduced_dist_LB_1 = min_rdist(self, i1, pt)
+            reduced_dist_LB_2 = min_rdist(self, i2, pt)
+
+            # recursively query subnodes
+            if reduced_dist_LB_1 <= reduced_dist_LB_2:
+                self._query_single_depthfirst_conditional(i1, pt, i_pt, heap,
+                                              reduced_dist_LB_1, mask)
+                self._query_single_depthfirst_conditional(i2, pt, i_pt, heap,
+                                              reduced_dist_LB_2, mask)
+            else:
+                self._query_single_depthfirst_conditional(i2, pt, i_pt, heap,
+                                              reduced_dist_LB_2, mask)
+                self._query_single_depthfirst_conditional(i1, pt, i_pt, heap,
+                                              reduced_dist_LB_1, mask)
+        return 0
 
     cdef int _query_single_depthfirst(self, ITYPE_t i_node,
                                       DTYPE_t* pt, ITYPE_t i_pt,

@@ -53,11 +53,11 @@ except ImportError:
     print("The package 'annoy' is required to run this example.")
     sys.exit()
 
-try:
-    import nmslib
-except ImportError:
-    print("The package 'nmslib' is required to run this example.")
-    sys.exit()
+#try:
+#    import nmslib
+#except ImportError:
+#    print("The package 'nmslib' is required to run this example.")
+#    sys.exit()
 
 import numpy as np
 import matplotlib.pyplot as plt
